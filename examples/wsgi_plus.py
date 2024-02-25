@@ -1,13 +1,16 @@
 import time
+from concurrent.futures import Future
 from threading import Thread
 
 
-def application(environ, start_response, resume):
+def application(environ, start_response):
     def thread():
-        time.sleep(10)
-        resume()
+        time.sleep(3)
+        fut.set_result(3)
+
     Thread(target=thread).start()
-    yield resume
+    fut = Future()
+    yield fut
     body = b'Dzozdra!\n'
     status = '200 OK'
     headers = [('Content-type', 'text/plain')]

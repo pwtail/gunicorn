@@ -20,6 +20,7 @@ import ssl
 import sys
 import time
 from collections import deque
+from concurrent.futures import Future
 from datetime import datetime
 from functools import partial
 from threading import RLock
@@ -115,20 +116,21 @@ class ThreadWorker(base.Worker):
         conn.init()
 
         def iterate():
-            gen = self.handle(conn, resume)
-            val = gen.send(None)
+            gen = self.handle(conn)
             while True:
-                if skip := (val is resume):
-                    yield ()
                 try:
-                    val = gen.send(skip)
+                    val = next(gen)
                 except StopIteration as e:
-                    yield (e.value,)
+                    yield e.value
+                if isinstance(val, Future):
+                    val.add_done_callback(resume)
+                    yield (), ()
 
         iterator = iterate()
 
-        def resume():
-            fs = self.tpool.submit(next, iterator)
+        def resume(fs=None):
+            if fs is None or not fs.exception():
+                fs = self.tpool.submit(next, iterator)
             self._wrap_future(fs, conn)
 
         resume()
@@ -260,12 +262,11 @@ class ThreadWorker(base.Worker):
             self.nr_conns -= 1
             fs.conn.close()
             return
-        if (result := fs.result()) is ():
-            return
-        else:
-            (result,) = result
         try:
-            (keepalive, conn) = result
+            (keepalive, conn) = fs.result()
+            if keepalive == conn == ():
+                # the app was suspended
+                return
             # if the connection should be kept alived add it
             # to the eventloop and record it
             if keepalive and self.alive:
@@ -289,7 +290,7 @@ class ThreadWorker(base.Worker):
             self.nr_conns -= 1
             fs.conn.close()
 
-    def handle(self, conn, resume):
+    def handle(self, conn):
         keepalive = False
         req = None
         try:
@@ -298,7 +299,7 @@ class ThreadWorker(base.Worker):
                 return (False, conn)
 
             # handle the request
-            keepalive = yield from self.handle_request(req, conn, resume)
+            keepalive = yield from self.handle_request(req, conn)
             if keepalive:
                 return (keepalive, conn)
         except http.errors.NoMoreData as e:
@@ -329,7 +330,7 @@ class ThreadWorker(base.Worker):
 
         return (False, conn)
 
-    def handle_request(self, req, conn, resume):
+    def handle_request(self, req, conn):
         environ = {}
         resp = None
         try:
@@ -350,14 +351,14 @@ class ThreadWorker(base.Worker):
             elif len(self._keep) >= self.max_keepalived:
                 resp.force_close()
 
-            respiter = self.wsgi(environ, resp.start_response, resume)
+            respiter = self.wsgi(environ, resp.start_response)
             try:
                 if isinstance(respiter, environ['wsgi.file_wrapper']):
                     resp.write_file(respiter)
                 else:
                     for item in respiter:
-                        skip = yield item
-                        if not skip:
+                        yield item
+                        if not isinstance(item, Future):
                             resp.write(item)
 
                 resp.close()
