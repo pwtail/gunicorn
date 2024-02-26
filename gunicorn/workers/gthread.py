@@ -20,6 +20,7 @@ import ssl
 import sys
 import time
 from collections import deque
+from concurrent.futures import Future
 from datetime import datetime
 from functools import partial
 from threading import RLock
@@ -113,9 +114,26 @@ class ThreadWorker(base.Worker):
 
     def enqueue_req(self, conn):
         conn.init()
-        # submit the connection to a worker
-        fs = self.tpool.submit(self.handle, conn)
-        self._wrap_future(fs, conn)
+
+        def iterate():
+            gen = self.handle(conn)
+            while True:
+                try:
+                    val = next(gen)
+                except StopIteration as e:
+                    yield e.value
+                if isinstance(val, Future):
+                    val.add_done_callback(resume)
+                    yield (), ()
+
+        iterator = iterate()
+
+        def resume(fs=None):
+            if fs is None or not fs.exception():
+                fs = self.tpool.submit(next, iterator)
+            self._wrap_future(fs, conn)
+
+        resume()
 
     def accept(self, server, listener):
         try:
@@ -244,9 +262,11 @@ class ThreadWorker(base.Worker):
             self.nr_conns -= 1
             fs.conn.close()
             return
-
         try:
             (keepalive, conn) = fs.result()
+            if keepalive == conn == ():
+                # the app was suspended
+                return
             # if the connection should be kept alived add it
             # to the eventloop and record it
             if keepalive and self.alive:
@@ -279,7 +299,7 @@ class ThreadWorker(base.Worker):
                 return (False, conn)
 
             # handle the request
-            keepalive = self.handle_request(req, conn)
+            keepalive = yield from self.handle_request(req, conn)
             if keepalive:
                 return (keepalive, conn)
         except http.errors.NoMoreData as e:
@@ -337,7 +357,9 @@ class ThreadWorker(base.Worker):
                     resp.write_file(respiter)
                 else:
                     for item in respiter:
-                        resp.write(item)
+                        yield item
+                        if not isinstance(item, Future):
+                            resp.write(item)
 
                 resp.close()
             finally:
